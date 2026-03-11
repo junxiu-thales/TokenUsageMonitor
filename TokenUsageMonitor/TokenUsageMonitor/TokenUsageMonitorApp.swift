@@ -76,20 +76,32 @@ class TokenManager: ObservableObject {
     @Published var budget: Double = 0.0
     @Published var isLoaded: Bool = false
     @Published var isError: Bool = false
-    @Published var errorMessage: String = "Loading..."
+    @Published var isLoading: Bool = false
+    @Published var lastUpdated: Date? = nil
     
     private var timer: Timer?
+    private var currentInterval: Double = 0
     
     init() {
         let savedInterval = UserDefaults.standard.object(forKey: "refreshInterval") as? Int ?? 30
+        currentInterval = Double(savedInterval)
         
         fetchUsage()
-        startTimer(interval: Double(savedInterval))
+        startTimer(interval: currentInterval)
+        
+        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            let newSaved = UserDefaults.standard.object(forKey: "refreshInterval") as? Int ?? 30
+            let newInterval = Double(newSaved)
+            
+            if newInterval != self?.currentInterval {
+                self?.currentInterval = newInterval
+                self?.startTimer(interval: newInterval)
+            }
+        }
     }
     
     func startTimer(interval: Double) {
         timer?.invalidate()
-        
         if interval > 0 {
             timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
                 self?.fetchUsage()
@@ -98,13 +110,19 @@ class TokenManager: ObservableObject {
     }
     
     func fetchUsage() {
+        guard !isLoading else { return }
+        
+        DispatchQueue.main.async {
+            self.isLoading = true
+        }
+        
         let urlString = UserDefaults.standard.string(forKey: "apiUrl") ?? ""
         let token = UserDefaults.standard.string(forKey: "apiToken") ?? ""
         
         guard let url = URL(string: urlString), !token.isEmpty else {
             DispatchQueue.main.async {
                 self.isError = true
-                self.errorMessage = "Missing API Credentials"
+                self.isLoading = false
             }
             return
         }
@@ -113,17 +131,17 @@ class TokenManager: ObservableObject {
         request.addValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         
         URLSession.shared.dataTask(with: request) { data, _, error in
-            if let data = data, let decoded = try? JSONDecoder().decode(APIResponse.self, from: data) {
-                DispatchQueue.main.async {
+            DispatchQueue.main.async {
+                self.isLoading = false
+                
+                if let data = data, let decoded = try? JSONDecoder().decode(APIResponse.self, from: data) {
                     self.spend = decoded.info.spend
                     self.budget = decoded.info.max_budget
                     self.isLoaded = true
                     self.isError = false
-                }
-            } else {
-                DispatchQueue.main.async {
+                    self.lastUpdated = Date()
+                } else {
                     self.isError = true
-                    self.errorMessage = "⚠️ API Error"
                 }
             }
         }.resume()
@@ -131,7 +149,6 @@ class TokenManager: ObservableObject {
 }
 
 struct SettingsView: View {
-    @Environment(\.scenePhase) private var scenePhase
     @AppStorage("apiUrl") private var apiUrl: String = ""
     @AppStorage("apiToken") private var apiToken: String = ""
     @AppStorage("displayMode") private var displayMode: DisplayMode = .spentTotal
@@ -182,7 +199,7 @@ struct SettingsView: View {
                 Label("Refresh", systemImage: "arrow.triangle.2.circlepath")
             }
         }
-        .frame(width: 450, height: 120)
+        .frame(width: 450, height: 150)
     }
 }
 
@@ -215,18 +232,18 @@ struct TokenUsageApp: App {
         }
     }
     
-    var intervalBinding: Binding<RefreshInterval> {
-        Binding(
-            get: { self.refreshInterval },
-            set: { newValue in
-                self.refreshInterval = newValue
-                manager.startTimer(interval: Double(newValue.rawValue))
-            }
-        )
-    }
-    
     var body: some Scene {
         MenuBarExtra {
+            if let lastUpdated = manager.lastUpdated {
+                Text("Last updated: \(lastUpdated.formatted(date: .omitted, time: .complete))")
+                    .foregroundColor(.secondary)
+            } else {
+                Text("Last updated: Never")
+                    .foregroundColor(.secondary)
+            }
+            
+            Divider()
+            
             Picker("Display Format", selection: $displayMode) {
                 ForEach(DisplayMode.allCases) { mode in
                     Text(mode.rawValue).tag(mode)
@@ -234,7 +251,7 @@ struct TokenUsageApp: App {
             }
             .pickerStyle(.menu)
             
-            Picker("Refresh Interval", selection: intervalBinding) {
+            Picker("Refresh Interval", selection: $refreshInterval) {
                 ForEach(RefreshInterval.allCases) { interval in
                     Text(interval.label).tag(interval)
                 }
@@ -243,10 +260,19 @@ struct TokenUsageApp: App {
             
             Divider()
             
-            Button("Refresh Now") {
+            Button(action: {
                 manager.fetchUsage()
+            }) {
+                HStack {
+                    Text(manager.isLoading ? "Refreshing..." : "Refresh Now")
+                    
+                    if manager.isLoading {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                    }
+                }
             }
             .keyboardShortcut("r")
+            .disabled(manager.isLoading)
             
             SettingsLink()
             
@@ -260,15 +286,14 @@ struct TokenUsageApp: App {
         } label: {
             Group {
                 if manager.isError {
-                    Text(manager.errorMessage)
+                    Image(systemName: "network.slash")
+                } else if manager.isLoading && !manager.isLoaded {
+                    Image(systemName: "arrow.triangle.2.circlepath")
                 } else if manager.isLoaded {
-                    Text(displayMode.format(spend: manager.spend, budget: manager.budget))
+                    Text(displayMode.format(spend: manager.spend, budget: manager.budget)).monospacedDigit()
                 } else {
-                    Text("Connecting...")
+                    Image(systemName: "ellipsis")
                 }
-            }
-            .onChange(of: refreshInterval) { newValue in
-                manager.startTimer(interval: Double(newValue.rawValue))
             }
         }
         
